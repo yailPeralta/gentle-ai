@@ -249,9 +249,6 @@ func (store Store) installBundle(chain ValidatedChain, events []ChainBundleEvent
 		}
 		defer maintenance.Release()
 	}
-	if err := os.MkdirAll(filepath.Join(store.Dir, "events"), 0o755); err != nil {
-		return ValidatedChain{}, err
-	}
 	lock, err := acquireLocalStoreLock(filepath.Join(store.Dir, "LOCK"))
 	if err != nil {
 		return ValidatedChain{}, err
@@ -262,6 +259,12 @@ func (store Store) installBundle(chain ValidatedChain, events []ChainBundleEvent
 		return ValidatedChain{}, err
 	}
 	if current != "" {
+		if current != chain.HeadRevision {
+			return ValidatedChain{}, ErrConcurrentUpdate
+		}
+		if err := publishLegacyAuthority(lock, store.Dir, events, current, authorityPublicationExisting); err != nil {
+			return ValidatedChain{}, err
+		}
 		loaded, err := store.loadChain(current)
 		if err == nil && current == chain.HeadRevision && loaded.Identity == chain.Identity {
 			return loaded, nil
@@ -272,12 +275,8 @@ func (store Store) installBundle(chain ValidatedChain, events []ChainBundleEvent
 		if event.Revision != chain.Revisions[index] {
 			return ValidatedChain{}, errors.New("review bundle installation order changed")
 		}
-		path := filepath.Join(store.Dir, "events", strings.TrimPrefix(event.Revision, "sha256:")+".json")
-		if err := installContentAddressedFile(path, event.Payload); err != nil {
-			return ValidatedChain{}, err
-		}
 	}
-	if err := writeAtomic(filepath.Join(store.Dir, "HEAD"), []byte(chain.HeadRevision+"\n"), 0o644); err != nil {
+	if err := publishLegacyAuthority(lock, store.Dir, events, chain.HeadRevision, authorityPublicationReplace); err != nil {
 		return ValidatedChain{}, err
 	}
 	return store.loadChain(chain.HeadRevision)

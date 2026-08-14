@@ -662,6 +662,9 @@ func RetryCompactFinalVerification(ctx context.Context, repo string, request Fin
 	}
 	if successorExists {
 		if compactStateEqual(existing.State, successor) {
+			if err := verifyCompactRecord(lock, successorStore, existing); err != nil {
+				return CompactRecord{}, err
+			}
 			return existing, nil
 		}
 		return CompactRecord{}, denyFinalVerificationRetry("different_replay", "existing successor does not match the exact retry request")
@@ -681,7 +684,7 @@ func RetryCompactFinalVerification(ctx context.Context, repo string, request Fin
 	if err != nil {
 		return CompactRecord{}, err
 	}
-	if err := publishImmutable(successorStore.StatePath(), payload, 0o644); err != nil {
+	if err := publishCompactAuthority(lock, successorStore, compactStateFileName, payload, authorityPublicationImmutable); err != nil {
 		var conflict *ImmutablePublicationConflictError
 		if errors.As(err, &conflict) {
 			return CompactRecord{}, denyFinalVerificationRetry("successor_collision", "successor authority was published concurrently with different bytes")

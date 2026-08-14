@@ -162,6 +162,7 @@ type CompactRecord struct {
 	// HistoricalCompat marks a record loaded through the retired-field
 	// compatibility path; such authority is read-only.
 	HistoricalCompat bool `json:"-"`
+	raw              []byte
 }
 
 // historicalCompactForensicRecord is raw-byte identity, never authority.
@@ -386,6 +387,9 @@ func RecoverCompactAuthority(ctx context.Context, repo string, request CompactRe
 	}
 	if existingErr == nil {
 		if compactStateEqual(existing.State, request.Successor) {
+			if err := verifyCompactRecord(lock, successorStore, existing); err != nil {
+				return CompactRecord{}, err
+			}
 			return existing, nil
 		}
 		return CompactRecord{}, errors.New("recovery successor lineage already exists with different authority")
@@ -433,7 +437,7 @@ func RecoverCompactAuthority(ctx context.Context, repo string, request CompactRe
 	if err != nil {
 		return CompactRecord{}, err
 	}
-	if err := writeAtomic(successorStore.StatePath(), payload, 0o644); err != nil {
+	if err := publishCompactAuthority(lock, successorStore, compactStateFileName, payload, authorityPublicationReplace); err != nil {
 		return CompactRecord{}, err
 	}
 	return record, nil
@@ -1207,6 +1211,9 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 	if request.ExplicitLineage {
 		record, loadErr := requestedStore.Load()
 		if loadErr == nil {
+			if err := verifyCompactRecord(lock, requestedStore, record); err != nil {
+				return CompactStartResult{}, err
+			}
 			hasSuccessor, successorErr := explicitCompactSuccessor(ctx, requestedStore.repo, record)
 			if successorErr != nil {
 				return CompactStartResult{}, fmt.Errorf("validate explicit compact start successor: %w", successorErr)
@@ -1301,6 +1308,9 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 	}
 	for _, store := range claimants {
 		record := records[store.lineageID]
+		if err := verifyCompactRecord(lock, store, record); err != nil {
+			return CompactStartResult{}, err
+		}
 		switch record.State.State {
 		case StateReviewing:
 			if record.State.InitialSnapshot.CandidateTree != request.State.InitialSnapshot.CandidateTree {
@@ -1352,7 +1362,7 @@ func StartCompactAuthority(ctx context.Context, repo string, request CompactStar
 	if err != nil {
 		return CompactStartResult{}, err
 	}
-	if err := writeAtomic(requestedStore.StatePath(), payload, 0o644); err != nil {
+	if err := publishCompactAuthority(lock, requestedStore, compactStateFileName, payload, authorityPublicationReplace); err != nil {
 		return CompactStartResult{}, err
 	}
 	if request.TracePath != "" {
@@ -1801,6 +1811,17 @@ func (store CompactStore) ReceiptPath() string {
 	return filepath.Join(store.Dir, compactReceiptFileName)
 }
 
+func verifyCompactRecord(lock *storeLock, store CompactStore, record CompactRecord) error {
+	if record.HistoricalCompat {
+		return publishCompactAuthority(lock, store, compactStateFileName, record.raw, authorityPublicationExisting)
+	}
+	want, payload, err := makeCompactRecord(record.State)
+	if err != nil || want.Revision != record.Revision {
+		return errors.New("compact authority record checksum changed") // refusal:by-design world-action: in-memory authority contradicts its content digest and requires code or storage repair
+	}
+	return publishCompactAuthority(lock, store, compactStateFileName, payload, authorityPublicationExisting)
+}
+
 func (store CompactStore) Load() (CompactRecord, error) {
 	return store.LoadContext(context.Background())
 }
@@ -1926,6 +1947,9 @@ func (store CompactStore) replaceContextGuarded(ctx context.Context, expectedRev
 		return "", err
 	}
 	if current != nil && current.Revision == record.Revision && compactStateEqual(current.State, next) {
+		if err := publishCompactAuthority(lock, store, compactStateFileName, payload, authorityPublicationExisting); err != nil {
+			return "", err
+		}
 		return record.Revision, nil
 	}
 	currentRevision := ""
@@ -1964,7 +1988,7 @@ func (store CompactStore) replaceContextGuarded(ctx context.Context, expectedRev
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if err := writeAtomic(store.StatePath(), payload, 0o644); err != nil {
+	if err := publishCompactAuthority(lock, store, compactStateFileName, payload, authorityPublicationReplace); err != nil {
 		return "", err
 	}
 	if store.TracePath != "" {
@@ -2302,6 +2326,7 @@ func parseCompactRecord(payload []byte, lineageID string) (CompactRecord, error)
 			return CompactRecord{}, errors.New("compact review state checksum mismatch")
 		}
 	}
+	record.raw = append([]byte(nil), payload...)
 	return record, nil
 }
 
@@ -2643,21 +2668,21 @@ func ImportCompactTransport(ctx context.Context, repo string, transport CompactT
 		return CompactRecord{}, err
 	}
 	defer lock.release()
-	if err := store.installTransportRecordLocked(ctx, validated.Record); err != nil {
+	if err := store.installTransportRecordLocked(ctx, lock, validated.Record); err != nil {
 		return CompactRecord{}, err
 	}
 	if validated.Receipt != nil {
-		if err := store.writeReceiptLocked(*validated.Receipt); err != nil {
+		if err := store.writeReceiptLocked(lock, *validated.Receipt); err != nil {
 			return CompactRecord{}, err
 		}
 	}
 	return store.loadCompactRecordLocked()
 }
 
-func (store CompactStore) installTransportRecordLocked(ctx context.Context, record CompactRecord) error {
+func (store CompactStore) installTransportRecordLocked(ctx context.Context, lock *storeLock, record CompactRecord) error {
 	if existing, loadErr := store.loadCompactRecordLocked(); loadErr == nil {
 		if existing.Revision == record.Revision && compactStateEqual(existing.State, record.State) {
-			return nil
+			return verifyCompactRecord(lock, store, existing)
 		}
 		return ErrConcurrentUpdate
 	} else if !os.IsNotExist(loadErr) {
@@ -2670,7 +2695,7 @@ func (store CompactStore) installTransportRecordLocked(ctx context.Context, reco
 	if err != nil || want.Revision != record.Revision {
 		return errors.New("imported compact record checksum changed")
 	}
-	return writeAtomic(store.StatePath(), payload, 0o644)
+	return publishCompactAuthority(lock, store, compactStateFileName, payload, authorityPublicationReplace)
 }
 
 // WriteReceipt validates the receipt against authoritative compact state while
@@ -2685,10 +2710,10 @@ func (store CompactStore) WriteReceipt(ctx context.Context, receipt CompactRecei
 		return err
 	}
 	defer lock.release()
-	return store.writeReceiptLocked(receipt)
+	return store.writeReceiptLocked(lock, receipt)
 }
 
-func (store CompactStore) writeReceiptLocked(receipt CompactReceipt) error {
+func (store CompactStore) writeReceiptLocked(lock *storeLock, receipt CompactReceipt) error {
 	record, err := store.loadCompactRecordLocked()
 	if err != nil {
 		return err
@@ -2697,7 +2722,11 @@ func (store CompactStore) writeReceiptLocked(receipt CompactReceipt) error {
 	if err != nil || !compactReceiptEqual(receipt, want) {
 		return errors.New("compact receipt does not match authority")
 	}
-	return WriteCompactReceiptAtomic(store.ReceiptPath(), receipt)
+	payload, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		return err
+	}
+	return publishCompactAuthority(lock, store, compactReceiptFileName, append(payload, '\n'), authorityPublicationImmutable)
 }
 
 func validateCompactTransportDelivery(ctx context.Context, repo string, state CompactState) error {

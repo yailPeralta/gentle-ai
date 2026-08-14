@@ -57,6 +57,28 @@ func (err *ImmutablePublicationConflictError) Error() string {
 
 func (err *ImmutablePublicationConflictError) Unwrap() error { return err.Cause }
 
+type AuthorityPublicationNotStartedError struct{ Cause error }
+
+func (err *AuthorityPublicationNotStartedError) Error() string {
+	return fmt.Sprintf("authority publication did not start: %v", err.Cause)
+}
+func (err *AuthorityPublicationNotStartedError) Unwrap() error { return err.Cause }
+
+type UnsafeAuthorityPathError struct{ Cause error }
+
+func (err *UnsafeAuthorityPathError) Error() string {
+	return fmt.Sprintf("unsafe authority path: %v", err.Cause)
+}
+func (err *UnsafeAuthorityPathError) Unwrap() error { return err.Cause }
+
+type authorityPublicationMode uint8
+
+const (
+	authorityPublicationReplace authorityPublicationMode = iota
+	authorityPublicationImmutable
+	authorityPublicationExisting
+)
+
 // SyncReviewDirectory persists a directory entry when the platform supports it.
 // Windows filesystems may reject directory handles; in that case the file rename
 // remains atomic, but power-loss durability of the directory entry is not claimed.
@@ -200,9 +222,6 @@ func (store Store) append(expectedRevision string, record Record) (string, error
 		}
 		defer maintenance.Release()
 	}
-	if err := os.MkdirAll(filepath.Join(store.Dir, "events"), 0o755); err != nil {
-		return "", err
-	}
 	lockPath := filepath.Join(store.Dir, "LOCK")
 	lock, err := acquireLocalStoreLock(lockPath)
 	if err != nil {
@@ -224,15 +243,11 @@ func (store Store) append(expectedRevision string, record Record) (string, error
 		return "", err
 	}
 	if current == revision {
+		if err := publishLegacyAuthority(lock, store.Dir, []ChainBundleEvent{{Revision: revision, Payload: payload}}, revision, authorityPublicationExisting); err != nil {
+			return "", err
+		}
 		if _, err := store.loadChain(current); err != nil {
 			return "", err
-		}
-		existing, err := os.ReadFile(filepath.Join(store.Dir, "events", strings.TrimPrefix(revision, "sha256:")+".json"))
-		if err != nil {
-			return "", err
-		}
-		if !bytes.Equal(existing, payload) {
-			return "", ErrConcurrentUpdate
 		}
 		return revision, nil
 	}
@@ -280,38 +295,7 @@ func (store Store) append(expectedRevision string, record Record) (string, error
 			return "", err
 		}
 	}
-	temp, err := os.CreateTemp(filepath.Join(store.Dir, "events"), ".event-*")
-	if err != nil {
-		return "", err
-	}
-	tempPath := temp.Name()
-	defer os.Remove(tempPath)
-	if _, err := temp.Write(payload); err != nil {
-		_ = temp.Close()
-		return "", err
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return "", err
-	}
-	if err := temp.Close(); err != nil {
-		return "", err
-	}
-	eventPath := filepath.Join(store.Dir, "events", strings.TrimPrefix(revision, "sha256:")+".json")
-	if err := publishNoReplace(tempPath, eventPath); err != nil {
-		if os.IsExist(err) {
-			existing, readErr := os.ReadFile(eventPath)
-			if readErr != nil {
-				return "", readErr
-			}
-			if !reflect.DeepEqual(existing, payload) {
-				return "", errors.New("existing content-addressed review event does not match its revision")
-			}
-		} else {
-			return "", err
-		}
-	}
-	if err := writeAtomic(filepath.Join(store.Dir, "HEAD"), []byte(revision+"\n"), 0o644); err != nil {
+	if err := publishLegacyAuthority(lock, store.Dir, []ChainBundleEvent{{Revision: revision, Payload: payload}}, revision, authorityPublicationReplace); err != nil {
 		return "", err
 	}
 	return revision, nil

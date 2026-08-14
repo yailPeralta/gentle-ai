@@ -122,6 +122,96 @@ func (dir *authorityDirectory) publishImmutable(name string, payload []byte, mod
 	return dir.publish(name, payload, mode, true)
 }
 
+func (dir *authorityDirectory) verify(name string, payload []byte) error {
+	existing, err := readAuthorityFile(dir.fd, name, int64(len(payload)+1))
+	if err != nil || !bytes.Equal(existing, payload) {
+		return &ImmutablePublicationConflictError{Cause: errors.Join(err, errors.New("existing content differs"))} // refusal:by-design world-action: conflicting authority bytes require manual storage inspection
+	}
+	if err := dir.ops.fsync(dir.fd); err != nil {
+		return &directorySyncError{path: name, cause: err}
+	}
+	return nil
+}
+
+func publishLegacyAuthority(lock *storeLock, _ string, events []ChainBundleEvent, head string, mode authorityPublicationMode) error {
+	lineage, err := openLockedAuthorityDirectory(lock, filepath.Dir(lock.file.Name()))
+	if err != nil {
+		return err
+	}
+	defer lineage.close()
+	eventsDir, err := lineage.ensure("events")
+	if err != nil {
+		return authorityPreparationError(err)
+	}
+	defer eventsDir.close()
+	for _, event := range events {
+		name := strings.TrimPrefix(event.Revision, "sha256:") + ".json"
+		if mode == authorityPublicationExisting {
+			err = eventsDir.verify(name, event.Payload)
+		} else {
+			err = eventsDir.publishImmutable(name, event.Payload, 0o600)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if mode == authorityPublicationExisting {
+		return lineage.verify("HEAD", []byte(head+"\n"))
+	}
+	return lineage.replace("HEAD", []byte(head+"\n"), 0o644)
+}
+
+func publishCompactAuthority(lock *storeLock, store CompactStore, name string, payload []byte, mode authorityPublicationMode) error {
+	storeDir, err := filepath.Abs(store.Dir)
+	if err != nil {
+		return &AuthorityPublicationNotStartedError{Cause: err}
+	}
+	version, err := openLockedAuthorityDirectory(lock, filepath.Dir(storeDir))
+	if err != nil {
+		return err
+	}
+	defer version.close()
+	dir, err := version.ensure(filepath.Base(storeDir))
+	if err != nil {
+		return authorityPreparationError(err)
+	}
+	defer dir.close()
+	switch mode {
+	case authorityPublicationImmutable:
+		return dir.publishImmutable(name, payload, 0o644)
+	case authorityPublicationExisting:
+		return dir.verify(name, payload)
+	default:
+		return dir.replace(name, payload, 0o644)
+	}
+}
+
+func openLockedAuthorityDirectory(lock *storeLock, path string) (*authorityDirectory, error) {
+	dir, err := openAuthorityDirectory(path)
+	if err != nil {
+		return nil, authorityPreparationError(err)
+	}
+	fd, err := unix.Openat(dir.fd, filepath.Base(lock.file.Name()), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = dir.close()
+		return nil, &UnsafeAuthorityPathError{Cause: errors.New("authority publication left its lock domain")} // refusal:by-design world-action: a missing lock object is a different mutation domain
+	}
+	defer unix.Close(fd)
+	var held, found unix.Stat_t
+	if unix.Fstat(int(lock.file.Fd()), &held) != nil || unix.Fstat(fd, &found) != nil || held.Dev != found.Dev || held.Ino != found.Ino {
+		_ = dir.close()
+		return nil, &UnsafeAuthorityPathError{Cause: errors.New("authority publication left its lock domain")} // refusal:by-design world-action: a different lock inode is a different mutation domain
+	}
+	return dir, nil
+}
+
+func authorityPreparationError(err error) error {
+	if errors.Is(err, errUnsafeAuthorityComponent) {
+		return &UnsafeAuthorityPathError{Cause: err}
+	}
+	return &AuthorityPublicationNotStartedError{Cause: err}
+}
+
 func (dir *authorityDirectory) publish(name string, payload []byte, mode os.FileMode, immutable bool) (resultErr error) {
 	if name == "" || name == "." || name == ".." || filepath.Base(name) != name {
 		return fmt.Errorf("%w %q", errUnsafeAuthorityComponent, name)

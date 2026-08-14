@@ -788,6 +788,32 @@ func newReviewIntegrationFailure(operation string, args []string, runErr error) 
 		failure.NextAction = "retry_with_bounded_backoff"
 		return failure
 	}
+	var unsafeAuthority *reviewtransaction.UnsafeAuthorityPathError
+	if errors.As(runErr, &unsafeAuthority) {
+		failure.Phase = "pre_native"
+		failure.Code = "unsafe_authority_path"
+		failure.Message = "Authority publication refused unsafe filesystem ancestry; resolve it manually before retrying."
+		failure.MutationOutcome = ReviewMutationNotStarted
+		failure.AuthorityApplicability = "not_evaluated"
+		failure.RetrySafe = false
+		failure.Replayability = reviewtransaction.ReplayabilityManualActionRequired
+		failure.NextAction = "stop"
+		failure.Cause = ""
+		return failure
+	}
+	var publicationNotStarted *reviewtransaction.AuthorityPublicationNotStartedError
+	if errors.As(runErr, &publicationNotStarted) {
+		failure.Phase = "pre_native"
+		failure.Code = "authority_publication_not_started"
+		failure.Message = "Authority publication could not open or durably prepare its destination; no authority file was published."
+		failure.MutationOutcome = ReviewMutationNotStarted
+		failure.AuthorityApplicability = "not_evaluated"
+		failure.RetrySafe = true
+		failure.Replayability = reviewtransaction.ReplayabilityNotReplayable
+		failure.NextAction = "retry_with_bounded_backoff"
+		failure.Cause = ""
+		return failure
+	}
 	var gitTimeout *reviewtransaction.GitCommandTimeoutError
 	if errors.As(runErr, &gitTimeout) {
 		if gitTimeout.Aggregate {

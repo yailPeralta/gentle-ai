@@ -672,6 +672,17 @@ func TestNegotiatedStoreLockPreAcquisitionFailureIsNotStarted(t *testing.T) {
 	}
 }
 
+func TestAuthorityPublicationFailuresMapTruthfullyAndScrubCause(t *testing.T) {
+	failure := newReviewIntegrationFailure("review.start", nil, &reviewtransaction.AuthorityPublicationNotStartedError{Cause: errors.New(`open authority component "private-project": permission denied`)})
+	if failure.Code != "authority_publication_not_started" || failure.MutationOutcome != ReviewMutationNotStarted || !failure.RetrySafe || failure.Cause != "" {
+		t.Fatalf("transient publication failure = %#v", failure)
+	}
+	failure = newReviewIntegrationFailure("review.start", nil, &reviewtransaction.UnsafeAuthorityPathError{Cause: errors.New(`unsafe authority path component "private-project"`)})
+	if failure.Code != "unsafe_authority_path" || failure.MutationOutcome != ReviewMutationNotStarted || failure.RetrySafe || failure.NextAction != "stop" || failure.Cause != "" {
+		t.Fatalf("unsafe publication failure = %#v", failure)
+	}
+}
+
 func TestNegotiatedStatusProcessControlFailureIsTypedAndDiagnosable(t *testing.T) {
 	originalRunner := reviewFacadeCommandRunner
 	t.Cleanup(func() { reviewFacadeCommandRunner = originalRunner })
